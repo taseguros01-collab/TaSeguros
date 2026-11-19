@@ -171,6 +171,7 @@ form{display:grid;gap:16px}
           <div class="hp" aria-hidden="true"><label>Deixe vazio<input type="text" name="empresa_site" id="empresa_site" tabindex="-1" autocomplete="off"></label></div>
           <label class="consent"><input type="checkbox" id="aceite" name="aceite" required><span>Concordo em receber contato da Tá Seguros por WhatsApp, telefone ou e-mail e com o tratamento dos meus dados para fins de cotação, conforme a LGPD.</span></label>
           <span class="err" id="e-aceite" aria-live="polite"></span>
+          <span class="err" id="e-submit" aria-live="polite"></span>
           <button class="btn wide" type="submit" id="enviar">Quero minha cotação</button>
         </form>
         <div class="done" id="done" role="status" aria-live="polite">
@@ -291,17 +292,17 @@ tel.addEventListener('input', function(){
   tel.value = o;
 });
 
-/* ===== Validação e envio ===== */
+/* ===== Validação e registro do pedido no CRM ===== */
 function setErr(id, msg){
   var box = document.getElementById('f-' + id), e = document.getElementById('e-' + id);
   if (box) box.classList.toggle('bad', !!msg);
   if (e) e.textContent = msg || '';
   return !msg;
 }
-document.getElementById('lead').addEventListener('submit', function(ev){
+document.getElementById('lead').addEventListener('submit', async function(ev){
   ev.preventDefault();
   var f = ev.target;
-  if (f.empresa_site.value) return; // robô
+  if (f.empresa_site.value) return;
   var nome = f.nome.value.trim(), digits = f.telefone.value.replace(/\D/g,''), cidade = f.cidade.value.trim();
   var ok = true;
   ok = setErr('nome', nome.length < 3 ? 'Informe seu nome.' : '') && ok;
@@ -311,21 +312,18 @@ document.getElementById('lead').addEventListener('submit', function(ev){
   e.textContent = f.aceite.checked ? '' : 'Marque a caixa para continuar.';
   ok = f.aceite.checked && ok;
   if (!ok) { var first = f.querySelector('.bad input, .bad select'); if (first) first.focus(); return; }
-
   var lead = {
     nome: nome, telefone: f.telefone.value, email: f.email.value.trim(),
-    plano: f.plano.value, vidas: f.vidas.value, cidade: cidade,
-    pagina: location.href.split('?')[0], origem: document.referrer || '', data: new Date().toISOString()
+    plano: f.plano.value, vidas: f.vidas.value, cidade: cidade, consent: true,
+    pagina: location.href.split('?')[0], origem: document.referrer || '',
+    tracking: tracking, data: new Date().toISOString()
   };
-  for (var k in tracking) lead[k] = tracking[k];
-
-  var btn = document.getElementById('enviar'); btn.disabled = true; btn.textContent = 'Enviando...';
-
-  var send = Promise.resolve();
-  if (CONFIG.webhookUrl) {
-    send = fetch(CONFIG.webhookUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(lead) }).catch(function(){});
-  }
-  send.then(function(){
+  var btn = document.getElementById('enviar'), error = document.getElementById('e-submit');
+  btn.disabled = true; btn.textContent = 'Enviando...'; error.textContent = '';
+  try {
+    var response = await fetch('/api/public-leads', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(lead)});
+    var result = await response.json().catch(function(){return {}});
+    if (!response.ok) throw new Error(result.error || 'Não foi possível registrar agora. Tente novamente ou chame no WhatsApp.');
     try { if (window.fbq) fbq('track', 'Lead'); } catch(e) {}
     try { if (window.gtag && CONFIG.googleAdsLead) gtag('event', 'conversion', { send_to: CONFIG.googleAdsLead }); } catch(e) {}
     try { if (window.gtag) gtag('event', 'generate_lead'); } catch(e) {}
@@ -334,6 +332,10 @@ document.getElementById('lead').addEventListener('submit', function(ev){
     document.getElementById('done-nome').textContent = nome.split(' ')[0];
     document.getElementById('cotacao').classList.add('sent');
     document.getElementById('cotacao').scrollIntoView({ block:'center' });
-  });
+  } catch(err) {
+    error.textContent = err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Quero minha cotação';
+  }
 });
 </script>
