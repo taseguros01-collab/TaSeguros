@@ -1,22 +1,163 @@
-const COOKIE='ts_crm_session', SESSION_SECONDS=43200, enc=new TextEncoder();
-const reply=(data,status=200,headers={})=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers}});
-const fail=(message,status=400)=>reply({error:message},status);
-function originOk(req){const o=req.headers.get('Origin');if(!o)return true;try{return new URL(o).origin===new URL(req.url).origin}catch{return false}}
-async function body(req){if(!/^application\/json(?:\s*;|$)/i.test(req.headers.get('content-type')||''))throw Error('Formato de solicitação inválido.');if(Number(req.headers.get('content-length')||0)>12000)throw Error('O formulário excede o tamanho permitido.');return req.json()}
-function b64(bytes){let s='';for(const b of bytes)s+=String.fromCharCode(b);return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,'')}
-function unb64(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}
-async function sign(value,secret){const k=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);return new Uint8Array(await crypto.subtle.sign('HMAC',k,enc.encode(value)))}
-async function session(req,secret){const c=req.headers.get('Cookie')||'',m=c.split(';').map(x=>x.trim()).find(x=>x.startsWith(COOKIE+'='));if(!m)return false;let token;try{token=decodeURIComponent(m.slice(COOKIE.length+1))}catch{return false}const [p,s,x]=token.split('.');if(!p||!s||x)return false;try{const k=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['verify']);if(!await crypto.subtle.verify('HMAC',k,unb64(s),enc.encode(p)))return false;return JSON.parse(new TextDecoder().decode(unb64(p))).exp>Math.floor(Date.now()/1000)}catch{return false}}
-async function limited(req,env,bucket,limit,windowSec){const ip=req.headers.get('CF-Connecting-IP')||'unknown',hash=b64(await sign(bucket+':'+ip,env.SESSION_SECRET)),now=Math.floor(Date.now()/1000);await env.DB.prepare('DELETE FROM request_limits WHERE created_at < ?').bind(now-86400).run();const r=await env.DB.prepare('SELECT COUNT(*) AS n FROM request_limits WHERE bucket=? AND key_hash=? AND created_at>?').bind(bucket,hash,now-windowSec).first();if(Number(r?.n||0)>=limit)return false;await env.DB.prepare('INSERT INTO request_limits(bucket,key_hash,created_at) VALUES(?,?,?)').bind(bucket,hash,now).run();return true}
-function configured(env){return env.DB&&env.CRM_PASSWORD&&env.SESSION_SECRET}
-function validate(v,isPublic=false){const l={name:String(v.name||v.nome||'').trim().slice(0,80),phone:String(v.phone||v.telefone||'').trim().slice(0,20),email:String(v.email||'').trim().slice(0,120),city:String(v.city||v.cidade||'').trim().slice(0,80),plan:String(v.plan||v.plano||'Não informado').trim().slice(0,50),lives:String(v.lives||v.vidas||'').trim().slice(0,30),stage:String(v.stage||'novo'),next_return_at:String(v.next_return_at||v.returnDate||'').trim(),notes:String(v.notes||'').trim().slice(0,1200)};if(l.name.length<2||l.phone.replace(/\D/g,'').length<10)throw Error('Informe nome e WhatsApp válido.');if(l.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(l.email))throw Error('Informe um e-mail válido.');if(!['novo','atendimento','cotacao','retorno','fechado'].includes(l.stage))throw Error('Etapa inválida.');if(l.next_return_at&&!/^\d{4}-\d{2}-\d{2}$/.test(l.next_return_at))throw Error('Data de retorno inválida.');if(isPublic){l.stage='novo';l.notes=''}return l}
-async function api(ctx){const{request:req,env,params}=ctx,u=new URL(req.url),p=u.pathname,m=req.method;if(!configured(env))return reply({error:'CRM ainda não configurado.'},503);
- if(p==='/api/auth/session'&&m==='GET')return session(req,env.SESSION_SECRET)?reply({authenticated:true}):fail('Sessão expirada.',401);
- if(p==='/api/auth/login'&&m==='POST'){if(!originOk(req))return fail('Origem inválida.',403);if(!await limited(req,env,'login',8,900))return fail('Muitas tentativas. Aguarde 15 minutos.',429);try{const v=await body(req),a=enc.encode(String(v.password||'')),b=enc.encode(env.CRM_PASSWORD);let d=a.length^b.length;for(let i=0;i<Math.max(a.length,b.length);i++)d|=(a[i]||0)^(b[i]||0);if(d)return fail('Senha incorreta.',401);const payload=b64(enc.encode(JSON.stringify({exp:Math.floor(Date.now()/1000)+SESSION_SECONDS}))),token=payload+'.'+b64(await sign(payload,env.SESSION_SECRET));return reply({authenticated:true},200,{'set-cookie':`${COOKIE}=${encodeURIComponent(token)}; Max-Age=${SESSION_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Strict`})}catch(e){return fail(e.message||'Não foi possível entrar.')}}
- if(p==='/api/auth/logout'&&m==='POST'){if(!originOk(req))return fail('Origem inválida.',403);return reply({ok:true},200,{'set-cookie':`${COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`})}
- if(p==='/api/public-leads'&&m==='POST'){if(!originOk(req))return fail('Origem inválida.',403);if(!await limited(req,env,'public-lead',8,3600))return fail('Muitas solicitações deste acesso. Tente novamente mais tarde.',429);try{const v=await body(req);if(v.empresa_site)return reply({ok:true});if(v.consent!==true&&v.aceite!==true)return fail('É necessário aceitar o contato para solicitar a cotação.');const l=validate(v,true),id=crypto.randomUUID();await env.DB.prepare('INSERT INTO leads(id,name,phone,email,city,plan,lives,stage,next_return_at,notes,source,consent_at,updated_at) VALUES(?,?,?,?,?,?,?,"novo","","","site",datetime("now"),datetime("now"))').bind(id,l.name,l.phone,l.email,l.city,l.plan,l.lives).run();return reply({ok:true,id},201)}catch(e){return fail(e.message||'Não foi possível registrar o pedido.')}}
- if(p==='/api/leads'&&m==='GET'){if(!await session(req,env.SESSION_SECRET))return fail('Acesso não autorizado.',401);const r=await env.DB.prepare('SELECT id,name,phone,email,city,plan,lives,stage,next_return_at,notes,source,created_at,updated_at FROM leads ORDER BY CASE WHEN next_return_at="" THEN 1 ELSE 0 END,next_return_at,created_at DESC').all();return reply(r.results||[])}
- if(p==='/api/leads'&&m==='POST'){if(!originOk(req))return fail('Origem inválida.',403);if(!await session(req,env.SESSION_SECRET))return fail('Acesso não autorizado.',401);try{const l=validate(await body(req)),id=crypto.randomUUID();await env.DB.prepare('INSERT INTO leads(id,name,phone,email,city,plan,lives,stage,next_return_at,notes,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime("now"))').bind(id,l.name,l.phone,l.email,l.city,l.plan,l.lives,l.stage,l.next_return_at,l.notes,'manual').run();return reply({id},201)}catch(e){return fail(e.message||'Não foi possível salvar.')}}
- const match=p.match(/^\/api\/leads\/([^/]+)$/);if(match&&['PUT','DELETE'].includes(m)){if(!originOk(req))return fail('Origem inválida.',403);if(!await session(req,env.SESSION_SECRET))return fail('Acesso não autorizado.',401);const id=decodeURIComponent(match[1]);if(m==='DELETE'){const r=await env.DB.prepare('DELETE FROM leads WHERE id=?').bind(id).run();return r.meta?.changes?reply({ok:true}):fail('Cotação não encontrada.',404)}try{const old=await env.DB.prepare('SELECT * FROM leads WHERE id=?').bind(id).first();if(!old)return fail('Cotação não encontrada.',404);const l=validate({...old,...await body(req)});await env.DB.prepare('UPDATE leads SET name=?,phone=?,email=?,city=?,plan=?,lives=?,stage=?,next_return_at=?,notes=?,updated_at=datetime("now") WHERE id=?').bind(l.name,l.phone,l.email,l.city,l.plan,l.lives,l.stage,l.next_return_at,l.notes,id).run();return reply({ok:true})}catch(e){return fail(e.message||'Não foi possível atualizar.')}}
- return fail('Rota não encontrada.',404)}
-export async function onRequest(ctx){if(new URL(ctx.request.url).pathname.startsWith('/api/'))return api(ctx);return ctx.next()}
+import { json, fail, readJson, sameOrigin, makeSession, getSession, sessionCookie, rateLimit, dbRequired, validLead, hashPassword, verifyPassword } from './_lib.js';
+
+const admin = user => user?.role === 'admin';
+const cleanUsername = value => String(value || '').trim().toLowerCase();
+const safeUser = user => ({ id: user.id, username: user.username, name: user.name, role: user.role, active: Boolean(user.active), created_at: user.created_at });
+const passwordOk = value => typeof value === 'string' && value.length >= 12 && value.length <= 200;
+
+async function authenticated(request, env) {
+  const session = await getSession(request, env.SESSION_SECRET);
+  if (!session) return null;
+  const user = await env.DB.prepare('SELECT id,username,name,role,active FROM users WHERE id=?').bind(session.id).first();
+  return user?.active ? user : null;
+}
+async function activeSeller(env, id) {
+  if (!id) return true;
+  const user = await env.DB.prepare("SELECT id FROM users WHERE id=? AND role='seller' AND active=1").bind(id).first();
+  return !!user;
+}
+async function api({ request, env, params }) {
+  const url = new URL(request.url), path = url.pathname, method = request.method;
+  if (!dbRequired(env)) return json({ error: 'CRM ainda não configurado.' }, 503);
+
+  if (path === '/api/auth/session' && method === 'GET') {
+    const user = await authenticated(request, env);
+    if (!user) return fail('Sessão expirada ou acesso desativado.', 401);
+    return json({ authenticated: true, user: safeUser(user) });
+  }
+
+  if (path === '/api/auth/login' && method === 'POST') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    if (!await rateLimit(request, env, 'login', 8, 900)) return fail('Muitas tentativas. Aguarde 15 minutos.', 429);
+    try {
+      const body = await readJson(request), username = cleanUsername(body.username), password = String(body.password || '');
+      if (!username || !password) return fail('Informe usuário e senha.');
+      let user = await env.DB.prepare('SELECT id,username,name,role,password_hash,active,created_at FROM users WHERE username=? COLLATE NOCASE').bind(username).first();
+      if (!user && username === 'admin') {
+        const a = new TextEncoder().encode(password), b = new TextEncoder().encode(env.CRM_PASSWORD);
+        let diff = a.length ^ b.length; for (let i=0;i<Math.max(a.length,b.length);i++) diff |= (a[i]||0) ^ (b[i]||0);
+        if (!diff) {
+          const id = crypto.randomUUID(), passwordHash = await hashPassword(password);
+          await env.DB.prepare("INSERT OR IGNORE INTO users(id,username,name,role,password_hash) VALUES(?,'admin','Administrador','admin',?)").bind(id,passwordHash).run();
+          user = await env.DB.prepare('SELECT id,username,name,role,password_hash,active,created_at FROM users WHERE username=? COLLATE NOCASE').bind('admin').first();
+        }
+      }
+      if (!user || !user.active || !await verifyPassword(password, user.password_hash)) return fail('Usuário ou senha incorretos.', 401);
+      const publicUser = safeUser(user), token = await makeSession(env.SESSION_SECRET, publicUser);
+      return json({ authenticated: true, user: publicUser }, 200, { 'set-cookie': sessionCookie(token) });
+    } catch (error) { return fail(error.message || 'Não foi possível entrar.'); }
+  }
+
+  if (path === '/api/auth/logout' && method === 'POST') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    return json({ ok: true }, 200, { 'set-cookie': sessionCookie('', 0) });
+  }
+
+  if (path === '/api/public-leads' && method === 'POST') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    if (!await rateLimit(request, env, 'public-lead', 8, 3600)) return fail('Muitas solicitações deste acesso. Tente novamente mais tarde.', 429);
+    try {
+      const body = await readJson(request);
+      if (body.empresa_site) return json({ ok: true });
+      if (body.consent !== true && body.aceite !== true) return fail('É necessário aceitar o contato para solicitar a cotação.');
+      const lead = validLead(body, true), id = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO leads(id,name,phone,email,city,plan,lives,stage,next_return_at,notes,source,consent_at,updated_at) VALUES(?,?,?,?,?,?,?,"novo","","","site",datetime("now"),datetime("now"))').bind(id,lead.name,lead.phone,lead.email,lead.city,lead.plan,lead.lives).run();
+      return json({ ok: true, id }, 201);
+    } catch (error) { return fail(error.message || 'Não foi possível registrar o pedido.'); }
+  }
+
+  if (path === '/api/leads' && method === 'GET') {
+    const user = await authenticated(request, env); if (!user) return fail('Acesso não autorizado.', 401);
+    const base = `SELECT l.id,l.name,l.phone,l.email,l.city,l.plan,l.lives,l.stage,l.next_return_at,l.notes,l.source,l.created_at,l.updated_at,l.assigned_to,u.name AS assigned_name FROM leads l LEFT JOIN users u ON u.id=l.assigned_to`;
+    const result = admin(user)
+      ? await env.DB.prepare(`${base} ORDER BY CASE WHEN l.next_return_at='' THEN 1 ELSE 0 END,l.next_return_at,l.created_at DESC`).all()
+      : await env.DB.prepare(`${base} WHERE l.assigned_to=? ORDER BY CASE WHEN l.next_return_at='' THEN 1 ELSE 0 END,l.next_return_at,l.created_at DESC`).bind(user.id).all();
+    return json(result.results || []);
+  }
+
+  if (path === '/api/leads' && method === 'POST') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    const user = await authenticated(request, env); if (!user) return fail('Acesso não autorizado.', 401);
+    try {
+      const body = await readJson(request), lead = validLead(body), id = crypto.randomUUID();
+      const assignedTo = admin(user) ? (String(body.assigned_to || '').trim() || null) : user.id;
+      if (assignedTo && !await activeSeller(env, assignedTo) && !(admin(user) && assignedTo === user.id)) return fail('Vendedor selecionado não está ativo.', 400);
+      await env.DB.prepare('INSERT INTO leads(id,name,phone,email,city,plan,lives,stage,next_return_at,notes,source,assigned_to,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime("now"))').bind(id,lead.name,lead.phone,lead.email,lead.city,lead.plan,lead.lives,lead.stage,lead.next_return_at,lead.notes,'manual',assignedTo).run();
+      return json({ id }, 201);
+    } catch (error) { return fail(error.message || 'Não foi possível salvar.'); }
+  }
+
+  if (path === '/api/users' && method === 'GET') {
+    const user = await authenticated(request, env); if (!admin(user)) return fail('Acesso não autorizado.', 403);
+    const result = await env.DB.prepare('SELECT id,username,name,role,active,created_at FROM users ORDER BY CASE role WHEN "admin" THEN 0 ELSE 1 END,name COLLATE NOCASE').all();
+    return json((result.results || []).map(safeUser));
+  }
+
+  if (path === '/api/users' && method === 'POST') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    const user = await authenticated(request, env); if (!admin(user)) return fail('Acesso não autorizado.', 403);
+    try {
+      const body = await readJson(request), name = String(body.name || '').trim().slice(0,80), username = cleanUsername(body.username), password = String(body.password || '');
+      if (name.length < 2) return fail('Informe o nome do vendedor.');
+      if (!/^[a-z0-9._-]{3,40}$/.test(username)) return fail('O usuário deve ter 3 a 40 caracteres: letras, números, ponto, hífen ou sublinhado.');
+      if (!passwordOk(password)) return fail('A senha precisa ter entre 12 e 200 caracteres.');
+      const id = crypto.randomUUID(), passwordHash = await hashPassword(password);
+      await env.DB.prepare("INSERT INTO users(id,username,name,role,password_hash) VALUES(?,?,?,'seller',?)").bind(id,username,name,passwordHash).run();
+      const created = await env.DB.prepare('SELECT id,username,name,role,active,created_at FROM users WHERE id=?').bind(id).first();
+      return json({ user: safeUser(created) }, 201);
+    } catch (error) {
+      if (/UNIQUE|constraint/i.test(error.message || '')) return fail('Esse nome de usuário já está em uso.');
+      return fail(error.message || 'Não foi possível criar o usuário.');
+    }
+  }
+
+  const userMatch = path.match(/^\/api\/users\/([^/]+)$/);
+  if (userMatch && method === 'PUT') {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    const user = await authenticated(request, env); if (!admin(user)) return fail('Acesso não autorizado.', 403);
+    try {
+      const id = decodeURIComponent(userMatch[1]), body = await readJson(request);
+      const target = await env.DB.prepare('SELECT id,role FROM users WHERE id=?').bind(id).first();
+      if (!target) return fail('Usuário não encontrado.', 404);
+      if (target.role !== 'seller') return fail('Somente contas de vendedor podem ser alteradas aqui.', 400);
+      const fields = [], values = [];
+      if (typeof body.active === 'boolean') { fields.push('active=?'); values.push(body.active ? 1 : 0); }
+      if (body.name !== undefined) { const name=String(body.name).trim().slice(0,80); if(name.length<2)return fail('Informe o nome do vendedor.'); fields.push('name=?'); values.push(name); }
+      if (body.password !== undefined) { const password=String(body.password); if(!passwordOk(password))return fail('A senha precisa ter entre 12 e 200 caracteres.'); fields.push('password_hash=?'); values.push(await hashPassword(password)); }
+      if (!fields.length) return fail('Nenhuma alteração informada.');
+      values.push(id); await env.DB.prepare(`UPDATE users SET ${fields.join(',')} WHERE id=?`).bind(...values).run();
+      const updated=await env.DB.prepare('SELECT id,username,name,role,active,created_at FROM users WHERE id=?').bind(id).first();
+      return json({ user: safeUser(updated) });
+    } catch (error) { return fail(error.message || 'Não foi possível atualizar o usuário.'); }
+  }
+
+  const leadMatch = path.match(/^\/api\/leads\/([^/]+)$/);
+  if (leadMatch && ['PUT','DELETE'].includes(method)) {
+    if (!sameOrigin(request)) return fail('Origem inválida.', 403);
+    const user = await authenticated(request, env); if (!user) return fail('Acesso não autorizado.', 401);
+    const id = decodeURIComponent(leadMatch[1]);
+    const old = admin(user)
+      ? await env.DB.prepare('SELECT * FROM leads WHERE id=?').bind(id).first()
+      : await env.DB.prepare('SELECT * FROM leads WHERE id=? AND assigned_to=?').bind(id,user.id).first();
+    if (!old) return fail('Cotação não encontrada.', 404);
+    if (method === 'DELETE') {
+      if (!admin(user)) return fail('Somente a gestão pode excluir cotações.', 403);
+      const result = await env.DB.prepare('DELETE FROM leads WHERE id=?').bind(id).run();
+      return result.meta?.changes ? json({ ok:true }) : fail('Cotação não encontrada.',404);
+    }
+    try {
+      const body=await readJson(request), lead=validLead({ ...old, ...body });
+      const assignedTo=admin(user) ? (body.assigned_to !== undefined ? (String(body.assigned_to || '').trim() || null) : old.assigned_to) : old.assigned_to;
+      if (admin(user) && assignedTo && !await activeSeller(env,assignedTo)) return fail('Vendedor selecionado não está ativo.',400);
+      await env.DB.prepare('UPDATE leads SET name=?,phone=?,email=?,city=?,plan=?,lives=?,stage=?,next_return_at=?,notes=?,assigned_to=?,updated_at=datetime("now") WHERE id=?').bind(lead.name,lead.phone,lead.email,lead.city,lead.plan,lead.lives,lead.stage,lead.next_return_at,lead.notes,assignedTo,id).run();
+      return json({ ok:true });
+    } catch (error) { return fail(error.message || 'Não foi possível atualizar.'); }
+  }
+
+  return fail('Rota não encontrada.', 404);
+}
+
+export async function onRequest(context) {
+  if (new URL(context.request.url).pathname.startsWith('/api/')) return api(context);
+  return context.next();
+}
